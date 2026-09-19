@@ -57,28 +57,60 @@ const messageTemplates = [
     (web, otp) => `🚀 *[${web}]*\n\nKode akses akun Anda: *${otp}*.\nBerlaku 5 menit.`
 ];
 
+// --- Retry delay dengan exponential backoff ---
+function getRetryDelay(attempt) {
+    // 3s, 6s, 12s, 24s, max 60s
+    return Math.min(3000 * Math.pow(2, attempt), 60000);
+}
+
 // --- FUNGSI INISIALISASI BOT (MULTI-SESSION) ---
-async function startBot(botId) {
+async function startBot(botId, attempt = 0) {
     const sessionPath = path.join(SESSION_DIR, botId);
     if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    let state, saveCreds;
+    try {
+        ({ state, saveCreds } = await useMultiFileAuthState(sessionPath));
+    } catch (err) {
+        console.error(`[${botId}] Gagal load auth state:`, err.message);
+        return;
+    }
 
     if (!bots[botId]) {
-        bots[botId] = { sock: null, qr: '', status: 'INITIALIZING', isRunning: true };
+        bots[botId] = { sock: null, qr: '', status: 'INITIALIZING', isRunning: true, retryCount: 0 };
     }
 
     const botData = bots[botId];
     botData.isRunning = true;
     botData.status = 'CONNECTING';
 
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' })
-    });
+    // Bersihkan keepalive sebelumnya jika ada
+    if (botData._keepAliveTimer) {
+        clearInterval(botData._keepAliveTimer);
+        botData._keepAliveTimer = null;
+    }
+
+    let sock;
+    try {
+        sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            // Tambahan config untuk stabilitas koneksi
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000,     // ping ke WA tiap 25 detik
+            retryRequestDelayMs: 2000,
+            maxMsgRetryCount: 5,
+            getMessage: async () => undefined
+        });
+    } catch (err) {
+        console.error(`[${botId}] Gagal buat socket:`, err.message);
+        botData.status = 'ERROR';
+        return;
+    }
 
     botData.sock = sock;
+    botData.retryCount = attempt;
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -86,27 +118,72 @@ async function startBot(botId) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            botData.qr = await qrcode.toDataURL(qr);
-            botData.status = 'WAITING_QR';
+            try {
+                botData.qr = await qrcode.toDataURL(qr);
+                botData.status = 'WAITING_QR';
+            } catch (e) {
+                console.error(`[${botId}] QR gen error:`, e.message);
+            }
         }
 
         if (connection === 'close') {
             botData.qr = '';
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            if (shouldReconnect && botData.isRunning) {
+            // Bersihkan keepalive saat disconnect
+            if (botData._keepAliveTimer) {
+                clearInterval(botData._keepAliveTimer);
+                botData._keepAliveTimer = null;
+            }
+
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const reason = lastDisconnect?.error?.message || 'unknown';
+
+            console.warn(`[${botId}] Disconnect | Code: ${statusCode} | Reason: ${reason} | Attempt: ${attempt}`);
+
+            // Jika logged out, jangan reconnect — minta scan QR ulang
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.warn(`[${botId}] Logged out! Hapus sesi dan minta scan QR ulang.`);
+                botData.status = 'LOGGED_OUT';
+                botData.sock = null;
+                return;
+            }
+
+            // Jika bot masih aktif, reconnect dengan exponential backoff
+            if (botData.isRunning) {
                 botData.status = 'RECONNECTING';
-                setTimeout(() => startBot(botId), 3000);
+                const delay = getRetryDelay(attempt);
+                console.log(`[${botId}] Reconnect dalam ${delay / 1000}s...`);
+                setTimeout(() => startBot(botId, attempt + 1), delay);
             } else {
-                botData.status = 'DISCONNECTED';
+                botData.status = 'STOPPED';
                 botData.sock = null;
             }
+
         } else if (connection === 'open') {
             botData.qr = '';
             botData.status = 'CONNECTED';
-            console.log(`Bot [${botId}] Berhasil Terhubung!`);
+            botData.retryCount = 0; // reset retry counter setelah berhasil connect
+            console.log(`✅ Bot [${botId}] Berhasil Terhubung!`);
+
+            // Keepalive: kirim "presence available" tiap 30 detik agar koneksi tetap hidup
+            botData._keepAliveTimer = setInterval(async () => {
+                try {
+                    if (botData.sock && botData.status === 'CONNECTED') {
+                        await botData.sock.sendPresenceUpdate('available');
+                    } else {
+                        clearInterval(botData._keepAliveTimer);
+                    }
+                } catch (e) {
+                    // Jika gagal keepalive, kemungkinan sudah disconnect — biarkan handler atas yang reconnect
+                    clearInterval(botData._keepAliveTimer);
+                }
+            }, 30000);
         }
+    });
+
+    // Tangkap error tak terduga agar tidak crash proses Node
+    sock.ev.on('error', (err) => {
+        console.error(`[${botId}] Socket error:`, err?.message || err);
     });
 }
 
@@ -512,7 +589,36 @@ app.post('/api/blast', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server Multi-Session Panel jalan di port ${PORT}`);
     console.log(`📁 Session directory: ${SESSION_DIR}`);
+});
+
+// ==================== ANTI-SLEEP (Railway Free Tier) ====================
+// Self-ping tiap 10 menit agar server tidak tidur / di-restart Railway
+const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/health`
+    : `http://localhost:${PORT}/health`;
+
+setInterval(async () => {
+    try {
+        const http = require('http');
+        const https = require('https');
+        const client = SELF_URL.startsWith('https') ? https : http;
+        client.get(SELF_URL, (res) => {
+            // just ping, no need to process response
+        }).on('error', () => {});
+    } catch (e) {}
+}, 10 * 60 * 1000); // tiap 10 menit
+
+// ==================== GLOBAL ERROR HANDLER ====================
+// Cegah Node.js crash total karena error yang tidak tertangani
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught Exception:', err.message);
+    // Jangan exit — biarkan server tetap jalan
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('❌ Unhandled Rejection:', reason?.message || reason);
+    // Jangan exit — biarkan server tetap jalan
 });
